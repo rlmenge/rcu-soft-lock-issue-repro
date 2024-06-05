@@ -67,6 +67,7 @@ Run script
 ```
 ## golang repro
 ```
+go mod init
 go mod tidy
 go get github.com/containerd/cgroups/v3/cgroup1
 go get github.com/containerd/cgroups/v3/cgroup2
