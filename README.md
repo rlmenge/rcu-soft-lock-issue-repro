@@ -57,6 +57,7 @@ root@ubuntu:/home/rachel# cat /proc/5565/stack
 # Usage
 ## npm repro
 prerequisite: Install docker
+
 Get docker image
 ```
 # get image so that script doesn't keep pulling for it
@@ -73,10 +74,11 @@ This script creates several containers. Each container runs in new pid and mount
 - npm start: It's also a short live process. It will exit in a few seconds.
 
 When `npm start` exits, the process tree in that pid namespace will be like
+```
 npm start (pid 1)
    |__npm run zombie
            |__ sh -c "whle true; do echo zombie; sleep 1; done"
-
+```
 ## golang repro
 ```
 go mod init rcudeadlock.go
@@ -94,8 +96,10 @@ The entrypoint of new pid and mount namespaces is `rcudeadlock task && rcudeadlo
 - rcudeadlock start: Prints `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA` 10 times and exits.
 
 When `rcudeadlock start` exits, the process tree in that pid namespace will be like
+```
 rcudeadlock start (pid 1)
    |__rcudeadlock zombie
            |__bash -c "while true; do echo zombie; sleep 1; done".
+```
 
 Each rcudeadlock process will set up 4 idle io_uring threads before handling commands, like `task`, `zombie`, `done` and `start`. That is similar to npm reproducer. Not sure that it's related to io_uring. But with io_uring idle threads, it's easy to reproduce this issue.
