@@ -1,4 +1,4 @@
-Reproduce bug appears as soft lock which is associated with "zap_pid_ns_processes" and zombie defunct processes
+Reproduce soft lock which is associated with "zap_pid_ns_processes" and zombie defunct processes
 
 Example dmesg:
 ```
@@ -56,25 +56,46 @@ root@ubuntu:/home/rachel# cat /proc/5565/stack
 
 # Usage
 ## npm repro
-Install docker and then the zombie image
+prerequisite: Install docker
+Get docker image
 ```
-# get image so that script doesn't keep pulling
+# get image so that script doesn't keep pulling for it
 sudo docker run telescope.azurecr.io/issue-repro/zombie:v1.1.11
 ```
 Run script
 ```
 ./rcu-npm-repro.sh
 ```
+This script creates several containers. Each container runs in new pid and mount namespaces. The container's entrypoint is `npm run task && npm start`.
+- npm run task: This command is to run `npm run zombie & npm run done` command.
+- npm run zombie: It's to run `while true; do echo zombie; sleep 1; done`. Infinite loop to print zombies.
+- npm run done: It's to run `echo done`. Short live process.
+- npm start: It's also a short live process. It will exit in a few seconds.
+
+When `npm start` exits, the process tree in that pid namespace will be like
+npm start (pid 1)
+   |__npm run zombie
+           |__ sh -c "whle true; do echo zombie; sleep 1; done"
+
 ## golang repro
 ```
-go mod init
+go mod init rcudeadlock.go
 go mod tidy
-go get github.com/containerd/cgroups/v3/cgroup1
-go get github.com/containerd/cgroups/v3/cgroup2
-go get github.com/opencontainers/runtime-spec/specs-go
-go get github.com/urfave/cli
-go get golang.org/x/sys/unix 
 
 CGO_ENABLED=0 go build -o ./rcudeadlock ./
 sudo ./rcudeadlock
 ```
+This golang program is to simulate the npm reproducer without involving docker as dependency. This binary is using re-exec self to support multiple subcommands. It  also sets up processes in new pid and mount namespaces by unshare, since the `put_mnt_ns` is a critical code path in the kernel to reproduce this issue. Both mount and pid namespaces are required in this issue.
+
+The entrypoint of new pid and mount namespaces is `rcudeadlock task && rcudeadlock start`.
+- rcudeadlock task: This command is to run `rcudeadlock zombie & rcudeadlock done`
+- rcudeadlock zombie: It's to run `bash -c "while true; do echo zombie; sleep 1; done"`. Infinite loop to print zombies.
+- rcudeadlock done: Prints done and exits.
+- rcudeadlock start: Prints `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA` 10 times and exits.
+
+When `rcudeadlock start` exits, the process tree in that pid namespace will be like
+rcudeadlock start (pid 1)
+   |__rcudeadlock zombie
+           |__bash -c "while true; do echo zombie; sleep 1; done".
+
+Each rcudeadlock process will set up 4 idle io_uring threads before handling commands, like `task`, `zombie`, `done` and `start`. That is similar to npm reproducer. Not sure that it's related to io_uring. But with io_uring idle threads, it's easy to reproduce this issue.
