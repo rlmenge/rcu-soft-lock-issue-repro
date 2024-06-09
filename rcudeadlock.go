@@ -49,7 +49,8 @@ func Entrypoint() *cli.App {
 							panic(fmt.Errorf("failed to get executable path: %w", err))
 						}
 
-						cmd := exec.Command(exe, "rcu-deadlock", "--cpu_quota_us", "1000", "--cpu_period_us", "10000", cgroupPath)
+						// NOTE: disable cpu limit
+						cmd := exec.Command(exe, "rcu-deadlock", "--cpu_quota_us", "-1", "--cpu_period_us", "100000", cgroupPath)
 						cmd.Stdout = os.Stdout
 						cmd.Stderr = os.Stderr
 						if err := cmd.Run(); err != nil {
@@ -84,39 +85,41 @@ func RCUDeadlockCommand() cli.Command {
 
 			quota := cliCtx.Int64("cpu_quota_us")
 			period := cliCtx.Uint64("cpu_period_us")
-			switch mode := cgroups.Mode(); mode {
-			case cgroups.Unified:
-				mgr, err := cgroup2.NewManager("/sys/fs/cgroup", cgroupPath, &cgroup2.Resources{
-					CPU: &cgroup2.CPU{
-						Max: cgroup2.NewCPUMax(&quota, &period),
-					},
-				})
-				if err != nil {
-					return fmt.Errorf("failed to create cgroupv2 manager: %w", err)
-				}
-				if err := mgr.AddProc(uint64(os.Getpid())); err != nil {
-					return fmt.Errorf("failed to move to cgroup %s: %w", cgroupPath, err)
-				}
+			if quota != -1 {
+				switch mode := cgroups.Mode(); mode {
+				case cgroups.Unified:
+					mgr, err := cgroup2.NewManager("/sys/fs/cgroup", cgroupPath, &cgroup2.Resources{
+						CPU: &cgroup2.CPU{
+							Max: cgroup2.NewCPUMax(&quota, &period),
+						},
+					})
+					if err != nil {
+						return fmt.Errorf("failed to create cgroupv2 manager: %w", err)
+					}
+					if err := mgr.AddProc(uint64(os.Getpid())); err != nil {
+						return fmt.Errorf("failed to move to cgroup %s: %w", cgroupPath, err)
+					}
 
-			case cgroups.Legacy:
-				mgr, err := cgroup1.Load(cgroup1.RootPath)
-				if err != nil {
-					return fmt.Errorf("failed to load cgroupv1: %w", err)
+				case cgroups.Legacy:
+					mgr, err := cgroup1.Load(cgroup1.RootPath)
+					if err != nil {
+						return fmt.Errorf("failed to load cgroupv1: %w", err)
+					}
+					mgr, err = mgr.New(cgroupPath, &specs.LinuxResources{
+						CPU: &specs.LinuxCPU{
+							Quota:  &quota,
+							Period: &period,
+						},
+					})
+					if err != nil {
+						return fmt.Errorf("failed to update cpu quota/period: %w", err)
+					}
+					if err := mgr.AddProc(uint64(os.Getpid())); err != nil {
+						return fmt.Errorf("failed to move to cgroup %s: %w", cgroupPath, err)
+					}
+				default:
+					return fmt.Errorf("only support cgroupv1 and cgroupv2, excluding hybrid mode: %v", mode)
 				}
-				mgr, err = mgr.New(cgroupPath, &specs.LinuxResources{
-					CPU: &specs.LinuxCPU{
-						Quota:  &quota,
-						Period: &period,
-					},
-				})
-				if err != nil {
-					return fmt.Errorf("failed to update cpu quota/period: %w", err)
-				}
-				if err := mgr.AddProc(uint64(os.Getpid())); err != nil {
-					return fmt.Errorf("failed to move to cgroup %s: %w", cgroupPath, err)
-				}
-			default:
-				return fmt.Errorf("only support cgroupv1 and cgroupv2, excluding hybrid mode: %v", mode)
 			}
 
 			// NOTE: Set it self as subreaper so that it can be the
@@ -157,10 +160,6 @@ func RunTask() cli.Command {
 	return cli.Command{
 		Name: "task",
 		Action: func(cliCtx *cli.Context) error {
-			if err := createFourIdleIOUringThreads(); err != nil {
-				return err
-			}
-
 			// start to re-exec
 			exe, err := os.Executable()
 			if err != nil {
@@ -182,10 +181,6 @@ func RunZombie() cli.Command {
 	return cli.Command{
 		Name: "zombie",
 		Action: func(cliCtx *cli.Context) error {
-			if err := createFourIdleIOUringThreads(); err != nil {
-				return err
-			}
-
 			cmd := exec.Command("bash", "-c", "while true; do echo zombie; sleep 1; done")
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
@@ -201,10 +196,6 @@ func RunDone() cli.Command {
 	return cli.Command{
 		Name: "done",
 		Action: func(cliCtx *cli.Context) error {
-			if err := createFourIdleIOUringThreads(); err != nil {
-				return err
-			}
-
 			cmd := exec.Command("echo", "done")
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
@@ -220,10 +211,11 @@ func RunStart() cli.Command {
 	return cli.Command{
 		Name: "start",
 		Action: func(cliCtx *cli.Context) error {
-			if err := createFourIdleIOUringThreads(); err != nil {
-				return err
+			for i := 0; i < 6; i++ {
+				if err := createIOUringThread(); err != nil {
+					return err
+				}
 			}
-
 			for i := 0; i < 10; i++ {
 				fmt.Println("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
 			}
@@ -263,23 +255,8 @@ func setSubreaper(i int) error {
 	return unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, uintptr(i), 0, 0, 0)
 }
 
-// createFourIdleIOUringThreads creates 4 idle iouring threads.
-func createFourIdleIOUringThreads() error {
-	_, err := iouring.New(64, iouring.WithSQPoll())
-	if err != nil {
-		return fmt.Errorf("failed to create iouring with sq_poll: %w", err)
-	}
-
-	_, err = iouring.New(256, iouring.WithSQPoll(), iouring.WithSQPollThreadIdle(10*time.Millisecond))
-	if err != nil {
-		return fmt.Errorf("failed to create iouring with sq_poll and sq_poll_thread_idel=10ms: %w", err)
-	}
-
-	_, err = iouring.New(64, iouring.WithSQPoll(), iouring.WithSQPollThreadIdle(10*time.Millisecond))
-	if err != nil {
-		return fmt.Errorf("failed to create iouring with sq_poll and sq_poll_thread_idel=10ms: %w", err)
-	}
-
+// createIOUringThread creates one busy iou-wrk-thread.
+func createIOUringThread() error {
 	iour, err := iouring.New(64)
 	if err != nil {
 		return fmt.Errorf("failed to create iouring: %w", err)
@@ -296,23 +273,41 @@ func createFourIdleIOUringThreads() error {
 	}
 	defer curDirFile.Close()
 
-	var stat unix.Statx_t
-	req, err := iouring.Statx(int(curDirFile.Fd()), "./", 0, 0, &stat)
-	if err != nil {
-		return fmt.Errorf("failed to prepare statx iouring request: %w", err)
-	}
+	waitCh := make(chan struct{}, 0)
+	go func() error {
+		i := 0
+		for {
+			if i <= 2 {
+				i++
+			} else {
+				select {
+				case <-waitCh:
+				default:
+					close(waitCh)
+				}
+			}
+			var stat unix.Statx_t
+			req, err := iouring.Statx(int(curDirFile.Fd()), "./", 0, 0, &stat)
+			if err != nil {
+				return fmt.Errorf("failed to prepare statx iouring request: %w", err)
+			}
 
-	result, err := iour.SubmitRequest(
-		req,
-		make(chan iouring.Result, 1),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to submit statx request: %w", err)
-	}
-	<-result.Done()
-	if err := result.Err(); err != nil {
-		return fmt.Errorf("failed to run statx: %w", err)
-	}
-	fmt.Printf("DevMajor: %v, DevMinor: %v\n", stat.Dev_major, stat.Dev_minor)
+			result, err := iour.SubmitRequest(
+				req,
+				make(chan iouring.Result, 1),
+			)
+			if err != nil {
+				return fmt.Errorf("failed to submit statx request: %w", err)
+			}
+			<-result.Done()
+			if err := result.Err(); err != nil {
+				return fmt.Errorf("failed to run statx: %w", err)
+			}
+			if i <= 2 {
+				fmt.Printf("DevMajor: %v, DevMinor: %v\n", stat.Dev_major, stat.Dev_minor)
+			}
+		}
+	}()
+	<-waitCh
 	return nil
 }
